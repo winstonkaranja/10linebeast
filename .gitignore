@@ -1,0 +1,6 @@
+.env
+venv
+test_download.pdf
+test_preview.pdf
+test_output.pdf
+__pycache__
