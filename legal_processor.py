@@ -49,9 +49,10 @@ class StatelessLegalProcessor:
                 self.redis_client = redis.from_url(
                     redis_url,
                     decode_responses=True,
-                    socket_connect_timeout=1,
-                    socket_timeout=1,
-                    retry_on_timeout=True
+                    socket_connect_timeout=5,
+                    socket_timeout=10,
+                    retry_on_timeout=True,
+                    retry_on_error=[redis.ConnectionError, redis.TimeoutError]
                 )
                 # Test connection
                 self.redis_client.ping()
@@ -64,9 +65,10 @@ class StatelessLegalProcessor:
                     username=os.getenv('REDISUSER'),
                     password=os.getenv('REDISPASSWORD'),
                     decode_responses=True,
-                    socket_connect_timeout=1,
-                    socket_timeout=1,
-                    retry_on_timeout=True
+                    socket_connect_timeout=5,
+                    socket_timeout=10,
+                    retry_on_timeout=True,
+                    retry_on_error=[redis.ConnectionError, redis.TimeoutError]
                 )
                 # Test connection
                 self.redis_client.ping()
@@ -78,9 +80,10 @@ class StatelessLegalProcessor:
                     port=int(os.getenv('REDIS_PORT', 6379)),
                     password=os.getenv('REDIS_PASSWORD'),
                     decode_responses=True,
-                    socket_connect_timeout=1,
-                    socket_timeout=1,
-                    retry_on_timeout=True
+                    socket_connect_timeout=5,
+                    socket_timeout=10,
+                    retry_on_timeout=True,
+                    retry_on_error=[redis.ConnectionError, redis.TimeoutError]
                 )
                 # Test connection
                 self.redis_client.ping()
@@ -104,6 +107,29 @@ class StatelessLegalProcessor:
             'RAILWAY_DEPLOYMENT_ID'
         ]
         return any(os.getenv(var) for var in railway_indicators)
+    
+    def _safe_redis_operation(self, operation_func, *args, **kwargs):
+        """Perform Redis operation with retry logic and timeout handling"""
+        if not self.redis_client:
+            return None
+            
+        max_retries = 2
+        retry_delay = 0.1
+        
+        for attempt in range(max_retries + 1):
+            try:
+                return operation_func(*args, **kwargs)
+            except (redis.ConnectionError, redis.TimeoutError) as e:
+                if attempt < max_retries:
+                    logger.warning(f"Redis operation failed (attempt {attempt + 1}/{max_retries + 1}): {e}")
+                    time.sleep(retry_delay * (2 ** attempt))  # Exponential backoff
+                    continue
+                else:
+                    logger.warning(f"Redis operation failed after {max_retries + 1} attempts: {e}")
+                    return None
+            except Exception as e:
+                logger.warning(f"Unexpected Redis error: {e}")
+                return None
     
     def _generate_cache_key(self, documents: list, features: dict) -> str:
         """Generate deterministic cache key for document + features combo"""
@@ -156,37 +182,35 @@ class StatelessLegalProcessor:
         cache_key = self._generate_cache_key(documents, features)
         
         # Try Redis cache first for instant response
-        if self.redis_client:
+        cached_result = self._safe_redis_operation(self.redis_client.get, cache_key) if self.redis_client else None
+        
+        if cached_result:
+            # CACHE HIT - Ultra fast response (< 10ms)
+            logger.info(f"Cache HIT for {cache_key} - returning instant result")
             try:
-                cached_result = self.redis_client.get(cache_key)
+                if isinstance(cached_result, bytes):
+                    cached_result_str = cached_result.decode('utf-8')
+                else:
+                    cached_result_str = cached_result
+                cached_data = json.loads(cached_result_str)
                 
-                if cached_result:
-                    # CACHE HIT - Ultra fast response (< 10ms)
-                    logger.info(f"Cache HIT for {cache_key} - returning instant result")
-                    if isinstance(cached_result, bytes):
-                        cached_result_str = cached_result.decode('utf-8')
-                    else:
-                        cached_result_str = cached_result
-                    cached_data = json.loads(cached_result_str)
-                    
-                    return {
-                        'statusCode': 200,
-                        'body': json.dumps({
-                            'success': True,
-                            'processed_document': {
-                                'filename': self._generate_output_filename(documents),
-                                'content': cached_data['output_pdf'],
-                                'pages': cached_data['total_pages'],
-                                'features_applied': cached_data['features_applied'],
-                                'processing_time_seconds': 0.01,
-                                'from_cache': True
-                            }
-                        }),
-                        'headers': {'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*'}
-                    }
-                
-            except redis.RedisError as e:
-                logger.warning(f"Redis error: {e}")
+                return {
+                    'statusCode': 200,
+                    'body': json.dumps({
+                        'success': True,
+                        'processed_document': {
+                            'filename': self._generate_output_filename(documents),
+                            'content': cached_data['output_pdf'],
+                            'pages': cached_data['total_pages'],
+                            'features_applied': cached_data['features_applied'],
+                            'processing_time_seconds': 0.01,
+                            'from_cache': True
+                        }
+                    }),
+                    'headers': {'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*'}
+                }
+            except (json.JSONDecodeError, KeyError) as e:
+                logger.warning(f"Cache data corrupted, proceeding with fresh processing: {e}")
         
         # CACHE MISS or No Redis - Process documents
         logger.info(f"Cache MISS for {cache_key} - processing documents")
@@ -199,25 +223,25 @@ class StatelessLegalProcessor:
         
         # Cache the result in Redis with 1-hour expiration
         if self.redis_client:
-            try:
-                cache_data = {
-                    'output_pdf': result['output_pdf'],
-                    'total_pages': result['total_pages'],
-                    'features_applied': result['features_applied'],
-                    'processed_at': time.time()
-                }
-                
-                # Store in Redis with 1-hour TTL (3600 seconds)
-                self.redis_client.setex(
-                    cache_key, 
-                    3600,  # 1 hour expiration
-                    json.dumps(cache_data)
-                )
-                
+            cache_data = {
+                'output_pdf': result['output_pdf'],
+                'total_pages': result['total_pages'],
+                'features_applied': result['features_applied'],
+                'processed_at': time.time()
+            }
+            
+            # Store in Redis with 1-hour TTL (3600 seconds) using safe operation
+            cache_success = self._safe_redis_operation(
+                self.redis_client.setex,
+                cache_key,
+                3600,  # 1 hour expiration
+                json.dumps(cache_data)
+            )
+            
+            if cache_success:
                 logger.info(f"Cached result for {cache_key} - expires in 1 hour")
-                
-            except redis.RedisError as e:
-                logger.warning(f"Failed to cache result: {e}")
+            else:
+                logger.warning(f"Failed to cache result for {cache_key} - proceeding without cache")
         
         return {
             'statusCode': 200,
