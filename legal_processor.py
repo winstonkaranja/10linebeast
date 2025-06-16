@@ -49,10 +49,13 @@ class StatelessLegalProcessor:
                     socket_timeout=1,
                     retry_on_timeout=True
                 )
-            else:
-                # Fallback to individual Redis configuration (for local development)
+                # Test connection
+                self.redis_client.ping()
+                logger.info("Redis connected successfully via REDIS_URL")
+            elif os.getenv('REDIS_HOST') and not self._is_railway_deployment():
+                # Only try individual Redis settings for local development
                 self.redis_client = redis.Redis(
-                    host=os.getenv('REDIS_HOST', 'localhost'),
+                    host=os.getenv('REDIS_HOST'),
                     port=int(os.getenv('REDIS_PORT', 6379)),
                     password=os.getenv('REDIS_PASSWORD'),
                     decode_responses=True,
@@ -60,12 +63,28 @@ class StatelessLegalProcessor:
                     socket_timeout=1,
                     retry_on_timeout=True
                 )
-            # Test connection
-            self.redis_client.ping()
-            logger.info("Redis connected successfully")
+                # Test connection
+                self.redis_client.ping()
+                logger.info("Redis connected successfully via individual settings")
+            else:
+                # No Redis configuration or Railway deployment without Redis
+                deployment_type = "Railway deployment" if self._is_railway_deployment() else "local environment"
+                logger.info(f"No Redis service configured for {deployment_type} - running without cache")
+                self.redis_client = None
         except Exception as e:
             logger.warning(f"Redis connection failed: {e} - Running without cache")
             self.redis_client = None
+    
+    def _is_railway_deployment(self) -> bool:
+        """Detect if running in Railway deployment"""
+        # Railway sets several environment variables we can check
+        railway_indicators = [
+            'RAILWAY_ENVIRONMENT',
+            'RAILWAY_PROJECT_ID',
+            'RAILWAY_SERVICE_ID',
+            'RAILWAY_DEPLOYMENT_ID'
+        ]
+        return any(os.getenv(var) for var in railway_indicators)
     
     def _generate_cache_key(self, documents: list, features: dict) -> str:
         """Generate deterministic cache key for document + features combo"""
