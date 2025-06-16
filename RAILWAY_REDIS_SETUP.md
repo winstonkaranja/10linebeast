@@ -1,30 +1,28 @@
 # Railway Redis Setup Guide
 
 ## Current Status
-✅ Code is ready for Redis connection
-❌ Redis service not configured in Railway (hence "running without cache" messages)
+✅ Code is ready for Redis connection and supports Railway's auto-provided variables
+❌ Redis service not added to Railway project yet
 
-## Setup Steps
+## Simple Setup Steps
 
-### 1. Add Redis Database Service
+### 1. Add Redis Database Service (Only Step Needed!)
 1. Go to your Railway project dashboard
 2. Click "New Service" 
 3. Choose "Add Database"
 4. Select "Redis"
 5. Deploy the Redis service
 
-### 2. Configure Environment Variable
-1. Go to your main service (the one running legal_processor.py)
-2. Navigate to "Environment Variables" 
-3. Add new variable:
-   - **Name**: `REDIS_URL`
-   - **Value**: `${{ Redis.REDIS_URL }}`
-4. Save and redeploy
+**That's it!** Railway automatically provides these environment variables:
+- `REDISHOST` - Redis server hostname
+- `REDISPORT` - Redis server port
+- `REDISUSER` - Redis username (if applicable)
+- `REDISPASSWORD` - Redis password
 
-### 3. Verify Connection
-After deployment, check logs for:
+### 2. Verify Connection
+After adding Redis service, check logs for:
 ```
-INFO:legal_processor:Redis connected successfully via REDIS_URL
+INFO:legal_processor:Redis connected successfully via Railway Redis variables
 ```
 
 Instead of:

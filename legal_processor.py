@@ -39,9 +39,13 @@ class StatelessLegalProcessor:
         
         # Initialize Redis for ultra-fast caching
         try:
-            # Check if Railway REDIS_URL is available (preferred for Railway deployments)
+            # Check for Redis configuration in order of preference
             redis_url = os.getenv('REDIS_URL')
+            redishost = os.getenv('REDISHOST')  # Railway's Redis host variable
+            redis_host = os.getenv('REDIS_HOST')  # Manual configuration
+            
             if redis_url:
+                # REDIS_URL format (preferred)
                 self.redis_client = redis.from_url(
                     redis_url,
                     decode_responses=True,
@@ -52,10 +56,25 @@ class StatelessLegalProcessor:
                 # Test connection
                 self.redis_client.ping()
                 logger.info("Redis connected successfully via REDIS_URL")
-            elif os.getenv('REDIS_HOST') and not self._is_railway_deployment():
-                # Only try individual Redis settings for local development
+            elif redishost:
+                # Railway's Redis environment variables
                 self.redis_client = redis.Redis(
-                    host=os.getenv('REDIS_HOST'),
+                    host=redishost,
+                    port=int(os.getenv('REDISPORT', 6379)),
+                    username=os.getenv('REDISUSER'),
+                    password=os.getenv('REDISPASSWORD'),
+                    decode_responses=True,
+                    socket_connect_timeout=1,
+                    socket_timeout=1,
+                    retry_on_timeout=True
+                )
+                # Test connection
+                self.redis_client.ping()
+                logger.info("Redis connected successfully via Railway Redis variables")
+            elif redis_host and not self._is_railway_deployment():
+                # Manual Redis configuration (local development)
+                self.redis_client = redis.Redis(
+                    host=redis_host,
                     port=int(os.getenv('REDIS_PORT', 6379)),
                     password=os.getenv('REDIS_PASSWORD'),
                     decode_responses=True,
@@ -65,9 +84,9 @@ class StatelessLegalProcessor:
                 )
                 # Test connection
                 self.redis_client.ping()
-                logger.info("Redis connected successfully via individual settings")
+                logger.info("Redis connected successfully via manual configuration")
             else:
-                # No Redis configuration or Railway deployment without Redis
+                # No Redis configuration found
                 deployment_type = "Railway deployment" if self._is_railway_deployment() else "local environment"
                 logger.info(f"No Redis service configured for {deployment_type} - running without cache")
                 self.redis_client = None
