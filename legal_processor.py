@@ -5,10 +5,7 @@ from typing import List, Dict, Any, Union, Sequence
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
-import requests
 import time
-from datetime import datetime
-import uuid
 import hashlib
 
 # Redis for ultra-fast caching
@@ -31,161 +28,14 @@ logger = logging.getLogger(__name__)
 # Type alias for PDF objects
 PdfObject = Union[PdfReader, PdfWriter]
 
-class PaystackMpesaProcessor:
-    """
-    Paystack M-Pesa processor optimized for high-scale instant payments.
-    Uses async payment initiation + immediate verification for speed.
-    """
-    
-    def __init__(self):
-        self.secret_key = os.getenv('PAYSTACK_SECRET_KEY')
-        self.callback_url = os.getenv('PAYSTACK_CALLBACK_URL', 'https://dummy-url.com/webhook')
-        
-        # Paystack API endpoints
-        self.base_url = "https://api.paystack.co"
-        self.initialize_url = f"{self.base_url}/transaction/initialize"
-        self.verify_url = f"{self.base_url}/transaction/verify"
-        
-        # Connection pooling for better performance
-        self.session = requests.Session()
-        self.session.headers.update(self.get_headers())
-    
-    def get_headers(self) -> Dict[str, str]:
-        """Get authorization headers for Paystack API"""
-        return {
-            'Authorization': f'Bearer {self.secret_key}',
-            'Content-Type': 'application/json'
-        }
-    
-    def initiate_payment_fast(self, phone_number: str, amount: int, reference: str) -> Dict[str, Any]:
-        """
-        Initialize Paystack transaction for M-Pesa payment - RETURNS IMMEDIATELY
-        Customer will complete payment via Paystack checkout (includes M-Pesa option)
-        """
-        try:
-            phone_number = self._format_phone_number(phone_number)
-            amount_cents = amount * 100
-            
-            payload = {
-                "email": f"customer_{reference}@temp.com",
-                "amount": amount_cents,
-                "currency": "KES",
-                "reference": reference,
-                "callback_url": self.callback_url,
-                "metadata": {
-                    "description": f"Legal Document Processing - {reference}",
-                    "phone_number": phone_number,
-                    "custom_fields": [
-                        {
-                            "display_name": "Service",
-                            "variable_name": "service",
-                            "value": "Legal Document Processing"
-                        }
-                    ]
-                }
-            }
-            
-            response = self.session.post(self.initialize_url, json=payload, timeout=15)
-            response.raise_for_status()
-            
-            init_response = response.json()
-            
-            if not init_response.get('status'):
-                return {
-                    'success': False, 
-                    'error': init_response.get('message', 'Payment initialization failed')
-                }
-            
-            data = init_response.get('data', {})
-            
-            # Return checkout URL for customer to complete payment
-            return {
-                'success': True,
-                'reference': reference,
-                'payment_url': data.get('authorization_url'),
-                'access_code': data.get('access_code'),
-                'message': 'Visit payment URL to complete M-Pesa payment.',
-                'phone_hint': phone_number[-4:],  # Last 4 digits for confirmation
-                'amount': amount
-            }
-                
-        except Exception as e:
-            logger.error(f"Payment initialization failed: {e}")
-            return {'success': False, 'error': str(e)}
-    
-    def verify_payment_instant(self, reference: str) -> Dict[str, Any]:
-        """
-        Single verification call - no polling, returns current status
-        """
-        try:
-            response = self.session.get(f"{self.verify_url}/{reference}", timeout=10)
-            response.raise_for_status()
-            
-            verification_response = response.json()
-            
-            if not verification_response.get('status'):
-                return {
-                    'success': False,
-                    'error': verification_response.get('message', 'Verification failed'),
-                    'payment_status': 'failed'
-                }
-            
-            data = verification_response.get('data', {})
-            status = data.get('status')
-            
-            if status == 'success':
-                return {
-                    'success': True,
-                    'payment_status': 'completed',
-                    'transaction_id': data.get('id'),
-                    'reference': data.get('reference'),
-                    'amount': data.get('amount') / 100,
-                    'currency': data.get('currency'),
-                    'paid_at': data.get('paid_at'),
-                    'channel': data.get('channel')
-                }
-            elif status in ['failed', 'abandoned', 'cancelled']:
-                return {
-                    'success': False,
-                    'payment_status': 'failed',
-                    'error': f"Payment {status}: {data.get('gateway_response', 'Payment not completed')}"
-                }
-            else:  # pending, ongoing, etc.
-                return {
-                    'success': False,
-                    'payment_status': 'pending',
-                    'error': 'Payment still processing'
-                }
-                
-        except Exception as e:
-            logger.error(f"Payment verification failed: {e}")
-            return {
-                'success': False, 
-                'error': str(e),
-                'payment_status': 'error'
-            }
-    
-    def _format_phone_number(self, phone: str) -> str:
-        """Format phone number to 254XXXXXXXXX (Kenyan format for M-Pesa)"""
-        phone = phone.replace(' ', '').replace('-', '').replace('(', '').replace(')', '').replace('+', '')
-        
-        if phone.startswith('0'):
-            return '254' + phone[1:]
-        elif phone.startswith('254'):
-            return phone
-        else:
-            return '254' + phone
-
 class StatelessLegalProcessor:
     """
     Ultra-fast stateless legal document processor with Redis caching
-    Four modes: Quote → Preview → Pay → Download (optimized for instant responses)
+    Accepts documents, processes them (merge, paginate, tenth_line) and returns PDF immediately
     """
     
     def __init__(self):
         self.max_workers = min(32, (os.cpu_count() or 1) + 4)
-        self.mpesa = PaystackMpesaProcessor()
-        self.price_per_page_per_service = 1  # 1 KSH per page per service
         
         # Initialize Redis for ultra-fast caching
         try:
@@ -217,35 +67,30 @@ class StatelessLegalProcessor:
         features_hash = hashlib.md5(features_str.encode()).hexdigest()[:16]
         
         return f"doc_cache:{'_'.join(doc_hashes)}:{features_hash}"
+    
+    def _generate_output_filename(self, documents: list) -> str:
+        """Generate output filename based on first document name with (compiled) suffix"""
+        # Sort documents by order to get the first one
+        sorted_docs = sorted(documents, key=lambda x: x.get('order', 0))
+        first_doc_filename = sorted_docs[0].get('filename', 'document.pdf')
+        
+        # Remove .pdf extension and add (compiled)
+        base_name = first_doc_filename.replace('.pdf', '').replace('.PDF', '')
+        return f"{base_name} (compiled).pdf"
         
     def lambda_handler(self, event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         """
-        Ultra-fast handler with 4 distinct modes:
-        1. quote_only: Calculate pricing (1-2 seconds)
-        2. process_preview: Process docs + return preview (0.1-5 seconds) 
-        3. initiate_payment: Start payment process (2-3 seconds)
-        4. process_with_verification: Verify payment + return full document (0.1-8 seconds)
+        Simplified handler: processes documents and returns PDF immediately
         """
         try:
-            mode = event.get('mode', 'quote_only')
-            
-            if mode == 'quote_only':
-                return self._handle_quote_only(event)
-            elif mode == 'process_preview':
-                return self._handle_process_preview(event)
-            elif mode == 'initiate_payment':
-                return self._handle_initiate_payment(event)
-            elif mode == 'process_with_verification':
-                return self._handle_process_with_verification(event)
-            else:
-                return self._error_response("Invalid mode. Use: quote_only, process_preview, initiate_payment, or process_with_verification", 400)
+            return self._handle_process_documents(event)
                 
         except Exception as e:
             logger.error(f"Error in processing: {str(e)}")
             return self._error_response(f"Processing failed: {str(e)}", 500)
     
-    def _handle_quote_only(self, event: Dict[str, Any]) -> Dict[str, Any]:
-        """Mode 1: Get pricing quote only (1-2 seconds)"""
+    def _handle_process_documents(self, event: Dict[str, Any]) -> Dict[str, Any]:
+        """Process documents and return PDF immediately"""
         documents = event.get('documents', [])
         features = event.get('features', {})
         
@@ -255,74 +100,45 @@ class StatelessLegalProcessor:
         if not any(features.values()):
             return self._error_response("No features selected", 400)
         
-        quote = self._calculate_quote_fast(documents, features)
+        logger.info("Processing documents")
         
-        return {
-            'statusCode': 200,
-            'body': json.dumps({
-                'success': True,
-                'mode': 'quote_only',
-                'quote': quote,
-                'next_step': 'Use mode: process_preview to see preview before payment'
-            }),
-            'headers': {'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*'}
-        }
-
-    def _handle_process_preview(self, event: Dict[str, Any]) -> Dict[str, Any]:
-        """Mode 2: Process documents with Redis caching for instant preview (0.1-5 seconds)"""
-        documents = event.get('documents', [])
-        features = event.get('features', {})
-        
-        if not documents:
-            return self._error_response("No documents provided", 400)
-        
-        if not any(features.values()):
-            return self._error_response("No features selected", 400)
-        
-        logger.info("Processing documents for preview")
-        
-        # Generate cache key and preview reference
+        # Generate cache key
         cache_key = self._generate_cache_key(documents, features)
-        preview_reference = f"PREVIEW_{int(time.time())}_{cache_key[-8:]}"
         
-        # Try Redis cache first for instant preview
+        # Try Redis cache first for instant response
         if self.redis_client:
             try:
                 cached_result = self.redis_client.get(cache_key)
                 
                 if cached_result:
-                    # CACHE HIT - Ultra fast preview response (< 10ms)
-                    logger.info(f"Cache HIT for {cache_key} - returning instant preview")
-                    # Decode bytes to string if needed
+                    # CACHE HIT - Ultra fast response (< 10ms)
+                    logger.info(f"Cache HIT for {cache_key} - returning instant result")
                     if isinstance(cached_result, bytes):
-                        cached_result_str = cached_result if isinstance(cached_result, str) else cached_result.decode('utf-8') 
+                        cached_result_str = cached_result.decode('utf-8')
+                    else:
+                        cached_result_str = cached_result
                     cached_data = json.loads(cached_result_str)
                     
                     return {
                         'statusCode': 200,
                         'body': json.dumps({
                             'success': True,
-                            'mode': 'preview_ready',
-                            'preview_reference': preview_reference,
-                            'cache_key': cache_key,
                             'processed_document': {
-                                'filename': f'preview_{preview_reference}.pdf',
+                                'filename': self._generate_output_filename(documents),
                                 'content': cached_data['output_pdf'],
                                 'pages': cached_data['total_pages'],
                                 'features_applied': cached_data['features_applied'],
-                                'processing_time_seconds': 0.01,  # Cache hit time
-                                'is_preview': True,
+                                'processing_time_seconds': 0.01,
                                 'from_cache': True
-                            },
-                            'next_step': f'Ready for download! Use mode: initiate_payment with preview_reference: {preview_reference}'
+                            }
                         }),
                         'headers': {'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*'}
                     }
                 
             except redis.RedisError as e:
-                logger.warning(f"Redis error during preview: {e}")
+                logger.warning(f"Redis error: {e}")
         
-        # CACHE MISS or No Redis - Process documents (3-5 seconds)
+        # CACHE MISS or No Redis - Process documents
         logger.info(f"Cache MISS for {cache_key} - processing documents")
         
         # Sort documents by order
@@ -357,221 +173,21 @@ class StatelessLegalProcessor:
             'statusCode': 200,
             'body': json.dumps({
                 'success': True,
-                'mode': 'preview_ready',
-                'preview_reference': preview_reference,
-                'cache_key': cache_key,
                 'processed_document': {
-                    'filename': f'preview_{preview_reference}.pdf',
-                    'content': result['output_pdf'],  # Full processed document as preview
+                    'filename': self._generate_output_filename(documents),
+                    'content': result['output_pdf'],
                     'pages': result['total_pages'],
                     'features_applied': result['features_applied'],
                     'processing_time_seconds': result.get('processing_time', 0),
-                    'is_preview': True,
-                    'from_cache': False
-                },
-                'next_step': f'Ready for download! Use mode: initiate_payment with preview_reference: {preview_reference}'
-            }),
-            'headers': {'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*'}
-        }
-    
-    def _handle_initiate_payment(self, event: Dict[str, Any]) -> Dict[str, Any]:
-        """Mode 3: Initiate payment process (2-3 seconds) - MODIFIED to accept preview_reference"""
-        documents = event.get('documents', [])
-        features = event.get('features', {})
-        phone_number = event.get('phone_number')
-        preview_reference = event.get('preview_reference')  # NEW: Link to existing preview
-        
-        if not phone_number:
-            return self._error_response("Phone number required", 400)
-        
-        # Quick quote calculation (can reuse from preview or recalculate)
-        quote = self._calculate_quote_fast(documents, features)
-        
-        # Generate unique payment reference
-        if preview_reference:
-            # Link payment to existing preview
-            reference = f"PAY_{preview_reference.replace('PREVIEW_', '')}"
-        else:
-            # Create new reference if no preview was made
-            reference = f"LEGAL_{int(time.time())}_{str(uuid.uuid4())[:8]}"
-        
-        # Initiate payment (returns immediately)
-        payment_result = self.mpesa.initiate_payment_fast(
-            phone_number, 
-            quote['total_cost'], 
-            reference
-        )
-        
-        if not payment_result['success']:
-            return {
-                'statusCode': 400,
-                'body': json.dumps({
-                    'success': False,
-                    'error': 'Payment initiation failed',
-                    'details': payment_result.get('error'),
-                    'quote': quote
-                }),
-                'headers': {'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*'}
-            }
-        
-        return {
-            'statusCode': 200,
-            'body': json.dumps({
-                'success': True,
-                'mode': 'payment_initiated',
-                'payment_reference': reference,
-                'preview_reference': preview_reference,  # NEW: Maintain preview link
-                'payment_url': payment_result.get('payment_url'),
-                'access_code': payment_result.get('access_code'),
-                'message': payment_result.get('message'),
-                'phone_hint': f"***{payment_result.get('phone_hint')}",
-                'amount': payment_result.get('amount'),
-                'quote': quote,
-                'next_step': f'Customer completes payment at URL, then use mode: process_with_verification with reference: {reference}'
-            }),
-            'headers': {'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*'}
-        }
-    
-    def _handle_process_with_verification(self, event: Dict[str, Any]) -> Dict[str, Any]:
-        """Mode 4: Verify payment and return cached document for download (0.1-8 seconds)"""
-        documents = event.get('documents', [])
-        features = event.get('features', {})
-        payment_reference = event.get('payment_reference')
-        
-        if not payment_reference:
-            return self._error_response("Payment reference required", 400)
-        
-        # Verify payment status instantly
-        verification = self.mpesa.verify_payment_instant(payment_reference)
-        
-        if verification.get('payment_status') == 'pending':
-            return {
-                'statusCode': 202,  # Accepted but not complete
-                'body': json.dumps({
-                    'success': False,
-                    'payment_status': 'pending',
-                    'message': 'Payment still processing. Please try again in a few moments.',
-                    'retry_in_seconds': 10
-                }),
-                'headers': {'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*'}
-            }
-        
-        if not verification['success']:
-            return {
-                'statusCode': 402,  # Payment Required
-                'body': json.dumps({
-                    'success': False,
-                    'payment_status': verification.get('payment_status'),
-                    'error': 'Payment verification failed - download not authorized',
-                    'details': verification.get('error')
-                }),
-                'headers': {'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*'}
-            }
-        
-        # Payment verified - try to get from cache first for instant download
-        logger.info(f"Payment verified: {verification.get('transaction_id')} - Preparing download")
-        
-        cache_key = self._generate_cache_key(documents, features)
-        
-        # Try Redis cache first for instant download
-        if self.redis_client:
-            try:
-                cached_result = self.redis_client.get(cache_key)
-                
-                if cached_result:
-                    # CACHE HIT - Ultra fast download (< 100ms total)
-                    logger.info(f"Payment verified + Cache HIT - instant download ready")
-                    # Decode bytes to string if needed
-                    if isinstance(cached_result, bytes):
-                        cached_result_str = cached_result if isinstance(cached_result, str) else cached_result.decode('utf-8') 
-                    cached_data = json.loads(cached_result_str)
-                    
-                    return {
-                        'statusCode': 200,
-                        'body': json.dumps({
-                            'success': True,
-                            'mode': 'download_authorized',
-                            'payment_confirmed': True,
-                            'transaction_id': verification.get('transaction_id'),
-                            'payment_amount': verification.get('amount'),
-                            'processed_document': {
-                                'filename': f'legal_document_{payment_reference}.pdf',
-                                'content': cached_data['output_pdf'],  # Full document for download
-                                'pages': cached_data['total_pages'],
-                                'features_applied': cached_data['features_applied'],
-                                'processing_time_seconds': 0.05,  # Cache retrieval time
-                                'is_preview': False,  # This is the final downloadable version
-                                'download_authorized': True,
-                                'from_cache': True
-                            }
-                        }),
-                        'headers': {'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*'}
-                    }
-                
-            except redis.RedisError as e:
-                logger.warning(f"Redis error during download: {e}")
-        
-        # Cache miss or Redis error - process documents for download (3-8 seconds)
-        logger.info(f"Payment verified but cache miss - processing documents for download")
-        
-        # Sort documents by order
-        documents.sort(key=lambda x: x.get('order', 0))
-        
-        # Process documents (same as preview, but marked as final)
-        result = self._process_documents_fast(documents, features)
-        
-        return {
-            'statusCode': 200,
-            'body': json.dumps({
-                'success': True,
-                'mode': 'download_authorized',
-                'payment_confirmed': True,
-                'transaction_id': verification.get('transaction_id'),
-                'payment_amount': verification.get('amount'),
-                'processed_document': {
-                    'filename': f'legal_document_{payment_reference}.pdf',
-                    'content': result['output_pdf'],  # Full document for download
-                    'pages': result['total_pages'],
-                    'features_applied': result['features_applied'],
-                    'processing_time_seconds': result.get('processing_time', 0),
-                    'is_preview': False,  # This is the final downloadable version
-                    'download_authorized': True,
                     'from_cache': False
                 }
             }),
             'headers': {'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*'}
         }
+
     
-    def _calculate_quote_fast(self, documents: List[Dict], features: Dict[str, bool]) -> Dict[str, Any]:
-        """Ultra-fast quote calculation using parallel processing"""
-        
-        def count_pages_single(doc):
-            try:
-                content = base64.b64decode(doc['content'])
-                reader = PdfReader(io.BytesIO(content))
-                return len(reader.pages)
-            except Exception as e:
-                logger.error(f"Error reading PDF {doc.get('filename')}: {e}")
-                raise ValueError(f"Invalid PDF: {doc.get('filename')}")
-        
-        # Count pages in parallel for speed
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            page_counts = list(executor.map(count_pages_single, documents))
-        
-        total_pages = sum(page_counts)
-        selected_services = [service for service, enabled in features.items() if enabled]
-        service_count = len(selected_services)
-        total_cost = total_pages * service_count * self.price_per_page_per_service
-        
-        return {
-            'total_pages': total_pages,
-            'document_count': len(documents),
-            'selected_services': selected_services,
-            'service_count': service_count,
-            'cost_per_page_per_service': self.price_per_page_per_service,
-            'total_cost': total_cost,
-            'currency': 'KSH'
-        }
+    
+    
     
     def _process_documents_fast(self, documents: List[Dict], features: Dict) -> Dict[str, Any]:
         """Process documents with maximum parallelization and speed optimization"""
@@ -715,8 +331,11 @@ class StatelessLegalProcessor:
                             
                             if line_count % 10 == 0:
                                 line_bbox = line["bbox"]
-                                x = line_bbox[0] - 30
                                 y = (line_bbox[1] + line_bbox[3]) / 2
+                                
+                                # Right-align the line numbers at the page margin
+                                page_rect = page.rect
+                                x = page_rect.width - 50  # 50 points from right edge
                                 
                                 page.insert_text(
                                     (x, y),
@@ -792,11 +411,10 @@ def gcp_cloud_function_handler(request):
     except Exception as e:
         return json.dumps({'error': str(e)}), 500
 
-# Updated local testing examples for new 4-step flow
+# Local testing example for simplified workflow
 if __name__ == "__main__":
-    # Step 1: Get quote
-    quote_event = {
-        "mode": "quote_only",
+    # Direct document processing - no payment required
+    process_event = {
         "documents": [
             {
                 "filename": "brief.pdf",
@@ -811,72 +429,6 @@ if __name__ == "__main__":
         }
     }
     
-    # Step 2: Process for preview (NEW)
-    preview_event = {
-        "mode": "process_preview",
-        "documents": [
-            {
-                "filename": "brief.pdf",
-                "content": "base64_encoded_content_here",
-                "order": 1
-            }
-        ],
-        "features": {
-            "merge_pdfs": True,
-            "repaginate": True,
-            "tenth_lining": False
-        }
-    }
-    
-    # Step 3: Initiate payment (MODIFIED to include preview_reference)
-    payment_event = {
-        "mode": "initiate_payment",
-        "documents": [
-            {
-                "filename": "brief.pdf",
-                "content": "base64_encoded_content_here",
-                "order": 1
-            }
-        ],
-        "features": {
-            "merge_pdfs": True,
-            "repaginate": True,
-            "tenth_lining": False
-        },
-        "phone_number": "0712345678",
-        "preview_reference": "PREVIEW_1234567890_abcd1234"  # NEW: Link to preview
-    }
-    
-    # Step 4: Process with verification for download
-    download_event = {
-        "mode": "process_with_verification",
-        "documents": [
-            {
-                "filename": "brief.pdf",
-                "content": "base64_encoded_content_here",
-                "order": 1
-            }
-        ],
-        "features": {
-            "merge_pdfs": True,
-            "repaginate": True,
-            "tenth_lining": False
-        },
-        "payment_reference": "PAY_1234567890_abcd1234"
-    }
-    
-    print("=== Step 1: Quote Request (1-2 seconds) ===")
-    quote_result = lambda_handler(quote_event, None)
-    print(json.dumps(quote_result, indent=2))
-    
-    print("\n=== Step 2: Process for Preview (0.1-5 seconds) ===")
-    preview_result = lambda_handler(preview_event, None)
-    print(json.dumps(preview_result, indent=2))
-    
-    print("\n=== Step 3: Payment Initiation (2-3 seconds) ===")
-    payment_result = lambda_handler(payment_event, None)
-    print(json.dumps(payment_result, indent=2))
-    
-    print("\n=== Step 4: Process for Download after Payment (0.1-8 seconds) ===")
-    download_result = lambda_handler(download_event, None)
-    print(json.dumps(download_result, indent=2))
+    print("=== Document Processing (0.1-5 seconds) ===")
+    result = lambda_handler(process_event, None)
+    print(json.dumps(result, indent=2))

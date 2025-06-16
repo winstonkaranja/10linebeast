@@ -9,10 +9,14 @@ requests==2.31.0
 # Environment variables
 python-dotenv==1.0.0
 
+# FastAPI for web deployment
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+pydantic==2.5.0
+
 # Optional: For testing and development
 pytest==7.4.3
 pytest-asyncio==0.21.1
 
-
-#Caching
-redis
+# Redis for caching
+redis==5.0.1
