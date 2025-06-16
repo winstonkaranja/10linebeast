@@ -283,8 +283,8 @@ class StatelessLegalProcessor:
             for page_num, page in enumerate(reader.pages, 1):
                 packet = io.BytesIO()
                 can = canvas.Canvas(packet, pagesize=letter)
-                can.setFont("Helvetica", 10)
-                can.drawString(letter[0]/2 - 10, 30, str(page_num))
+                can.setFont("Helvetica", 15)
+                can.drawString(letter[0] - 50, letter[1] - 30, str(page_num))
                 can.save()
                 
                 packet.seek(0)
@@ -340,7 +340,7 @@ class StatelessLegalProcessor:
                                 page.insert_text(
                                     (x, y),
                                     str(line_count),
-                                    fontsize=8,
+                                    fontsize=9.6,
                                     color=(0.5, 0.5, 0.5)
                                 )
             
