@@ -508,8 +508,8 @@ class StatelessLegalProcessor:
                 })
         
         # Sort lines by vertical position (top to bottom)
-        # In PDF coordinates, higher Y values are at the top
-        lines.sort(key=lambda x: x['y'], reverse=True)
+        # In PyMuPDF coordinates, Y=0 is at top, Y increases downward
+        lines.sort(key=lambda x: x['y'])  # Ascending order: smallest Y (top) first
         
         return lines
     
