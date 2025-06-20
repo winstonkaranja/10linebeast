@@ -7,8 +7,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 import time
 import hashlib
+import uuid
+import threading
+from datetime import datetime, timedelta
 
-# Redis for ultra-fast caching
+# Redis for ultra-fast caching and job queue
 import redis
 
 # PDF processing imports
@@ -36,58 +39,59 @@ class StatelessLegalProcessor:
     
     def __init__(self):
         self.max_workers = min(32, (os.cpu_count() or 1) + 4)
+        self.background_workers = {}  # Track background worker threads
+        self.is_shutting_down = False
         
-        # Initialize Redis for ultra-fast caching
+        # Initialize Redis connection pool for ultra-fast caching
         try:
             # Check for Redis configuration in order of preference
             redis_url = os.getenv('REDIS_URL')
             redishost = os.getenv('REDISHOST')  # Railway's Redis host variable
             redis_host = os.getenv('REDIS_HOST')  # Manual configuration
             
+            # Enhanced connection pool settings for production
+            pool_kwargs = {
+                'decode_responses': True,
+                'socket_connect_timeout': 30,  # Increased from 5 to 30 seconds
+                'socket_timeout': 60,          # Increased from 10 to 60 seconds
+                'socket_keepalive': True,
+                'socket_keepalive_options': {},
+                'connection_pool_class': redis.BlockingConnectionPool,
+                'max_connections': 50,         # Connection pool size
+                'retry_on_timeout': True,
+                'retry_on_error': [redis.ConnectionError, redis.TimeoutError],
+                'health_check_interval': 30
+            }
+            
             if redis_url:
-                # REDIS_URL format (preferred)
-                self.redis_client = redis.from_url(
-                    redis_url,
-                    decode_responses=True,
-                    socket_connect_timeout=5,
-                    socket_timeout=10,
-                    retry_on_timeout=True,
-                    retry_on_error=[redis.ConnectionError, redis.TimeoutError]
-                )
+                # REDIS_URL format (preferred) with connection pooling
+                self.redis_client = redis.from_url(redis_url, **pool_kwargs)
                 # Test connection
                 self.redis_client.ping()
-                logger.info("Redis connected successfully via REDIS_URL")
+                logger.info("Redis connected successfully via REDIS_URL with connection pooling")
             elif redishost:
-                # Railway's Redis environment variables
+                # Railway's Redis environment variables with connection pooling
                 self.redis_client = redis.Redis(
                     host=redishost,
                     port=int(os.getenv('REDISPORT', 6379)),
                     username=os.getenv('REDISUSER'),
                     password=os.getenv('REDISPASSWORD'),
-                    decode_responses=True,
-                    socket_connect_timeout=5,
-                    socket_timeout=10,
-                    retry_on_timeout=True,
-                    retry_on_error=[redis.ConnectionError, redis.TimeoutError]
+                    **pool_kwargs
                 )
                 # Test connection
                 self.redis_client.ping()
-                logger.info("Redis connected successfully via Railway Redis variables")
+                logger.info("Redis connected successfully via Railway Redis variables with connection pooling")
             elif redis_host and not self._is_railway_deployment():
-                # Manual Redis configuration (local development)
+                # Manual Redis configuration (local development) with connection pooling
                 self.redis_client = redis.Redis(
                     host=redis_host,
                     port=int(os.getenv('REDIS_PORT', 6379)),
                     password=os.getenv('REDIS_PASSWORD'),
-                    decode_responses=True,
-                    socket_connect_timeout=5,
-                    socket_timeout=10,
-                    retry_on_timeout=True,
-                    retry_on_error=[redis.ConnectionError, redis.TimeoutError]
+                    **pool_kwargs
                 )
                 # Test connection
                 self.redis_client.ping()
-                logger.info("Redis connected successfully via manual configuration")
+                logger.info("Redis connected successfully via manual configuration with connection pooling")
             else:
                 # No Redis configuration found
                 deployment_type = "Railway deployment" if self._is_railway_deployment() else "local environment"
@@ -109,20 +113,47 @@ class StatelessLegalProcessor:
         return any(os.getenv(var) for var in railway_indicators)
     
     def _safe_redis_operation(self, operation_func, *args, **kwargs):
-        """Perform Redis operation with retry logic and timeout handling"""
+        """Perform Redis operation with enhanced retry logic and timeout handling"""
         if not self.redis_client:
             return None
             
-        max_retries = 2
-        retry_delay = 0.1
+        max_retries = 3  # Increased from 2 to 3
+        retry_delay = 0.2  # Increased base delay
         
         for attempt in range(max_retries + 1):
             try:
-                return operation_func(*args, **kwargs)
-            except (redis.ConnectionError, redis.TimeoutError) as e:
+                # Add timeout wrapper for operations
+                import signal
+                
+                def timeout_handler(signum, frame):
+                    raise TimeoutError("Redis operation timeout")
+                
+                # Set alarm for 30 seconds max per operation
+                old_handler = signal.signal(signal.SIGALRM, timeout_handler)
+                signal.alarm(30)
+                
+                try:
+                    result = operation_func(*args, **kwargs)
+                    signal.alarm(0)  # Cancel alarm
+                    signal.signal(signal.SIGALRM, old_handler)  # Restore handler
+                    return result
+                except TimeoutError:
+                    signal.alarm(0)
+                    signal.signal(signal.SIGALRM, old_handler)
+                    raise redis.TimeoutError("Operation timed out after 30 seconds")
+                    
+            except (redis.ConnectionError, redis.TimeoutError, TimeoutError) as e:
                 if attempt < max_retries:
-                    logger.warning(f"Redis operation failed (attempt {attempt + 1}/{max_retries + 1}): {e}")
-                    time.sleep(retry_delay * (2 ** attempt))  # Exponential backoff
+                    delay = retry_delay * (2 ** attempt)  # Exponential backoff
+                    logger.warning(f"Redis operation failed (attempt {attempt + 1}/{max_retries + 1}): {e} - retrying in {delay}s")
+                    time.sleep(delay)
+                    
+                    # Try to reconnect on connection errors
+                    if isinstance(e, redis.ConnectionError):
+                        try:
+                            self.redis_client.ping()
+                        except:
+                            pass  # Will retry with existing client
                     continue
                 else:
                     logger.warning(f"Redis operation failed after {max_retries + 1} attempts: {e}")
@@ -156,19 +187,39 @@ class StatelessLegalProcessor:
         
     def lambda_handler(self, event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         """
-        Simplified handler: processes documents and returns PDF immediately
+        Enhanced handler: supports both sync and async processing
         """
         try:
-            return self._handle_process_documents(event)
+            # Check if this is a background job request
+            if event.get('action') == 'submit_job':
+                return self._submit_background_job(event)
+            elif event.get('action') == 'check_job':
+                return self._check_job_status(event)
+            elif event.get('action') == 'get_result':
+                return self._get_job_result(event)
+            else:
+                # Default: immediate processing (with fallback to background for large docs)
+                return self._handle_process_documents(event)
                 
         except Exception as e:
             logger.error(f"Error in processing: {str(e)}")
             return self._error_response(f"Processing failed: {str(e)}", 500)
     
     def _handle_process_documents(self, event: Dict[str, Any]) -> Dict[str, Any]:
-        """Process documents with smart handling for massive files"""
+        """Process documents with smart handling for massive files and auto-background processing"""
         documents = event.get('documents', [])
         features = event.get('features', {})
+        
+        # Check if this should be processed in background (large docs or if explicitly requested)
+        should_use_background = (
+            self._is_massive_document(documents) or 
+            event.get('force_background', False) or
+            self._should_use_background_processing(documents, features)
+        )
+        
+        if should_use_background and self.redis_client:
+            logger.info("Auto-routing to background processing for large/complex document")
+            return self._submit_background_job(event)
         
         # Check if this is a massive document that needs special handling
         if self._is_massive_document(documents):
@@ -224,8 +275,25 @@ class StatelessLegalProcessor:
         # Sort documents by order
         documents.sort(key=lambda x: x.get('order', 0))
         
-        # Process documents with all features applied
-        result = self._process_documents_fast(documents, features)
+        # Process documents with all features applied and timeout protection
+        try:
+            # Add overall processing timeout (5 minutes max)
+            import signal
+            
+            def processing_timeout_handler(signum, frame):
+                raise TimeoutError("Document processing exceeded 5 minutes")
+            
+            old_handler = signal.signal(signal.SIGALRM, processing_timeout_handler)
+            signal.alarm(300)  # 5 minutes
+            
+            result = self._process_documents_fast(documents, features)
+            
+            signal.alarm(0)  # Cancel timeout
+            signal.signal(signal.SIGALRM, old_handler)
+            
+        except TimeoutError as e:
+            logger.error(f"Processing timeout: {e}")
+            return self._error_response("Document processing timed out. Please try again or contact support.", 408)
         
         # Cache the result in Redis with 1-hour expiration
         if self.redis_client:
@@ -356,9 +424,19 @@ class StatelessLegalProcessor:
                 logger.error(f"Failed to decode PDF {doc_data.get('filename', 'unknown')}: {e}")
                 raise ValueError(f"Invalid PDF: {doc_data.get('filename', 'unknown')}")
         
-        # Use optimal thread count for I/O bound operations
+        # Use optimal thread count for I/O bound operations with timeout
         with ThreadPoolExecutor(max_workers=min(len(documents) * 2, self.max_workers)) as executor:
-            pdf_readers = list(executor.map(decode_single_pdf_fast, documents))
+            try:
+                # Add timeout for PDF decoding (2 minutes max)
+                futures = [executor.submit(decode_single_pdf_fast, doc) for doc in documents]
+                pdf_readers = []
+                
+                for future in as_completed(futures, timeout=120):  # 2 minutes timeout
+                    pdf_readers.append(future.result())
+                    
+            except Exception as e:
+                logger.error(f"PDF decoding failed or timed out: {e}")
+                raise ValueError(f"PDF processing failed: {str(e)}")
         
         return pdf_readers
     
@@ -682,6 +760,27 @@ class StatelessLegalProcessor:
         massive_threshold = 10 * 1024 * 1024  # 10MB
         return total_size > massive_threshold
     
+    def _should_use_background_processing(self, documents: List[Dict], features: Dict) -> bool:
+        """Determine if processing should be done in background based on complexity"""
+        # Calculate total document size
+        total_size = sum(len(doc.get('content', '')) for doc in documents)
+        
+        # Use background for documents over 5MB (roughly 100+ pages)
+        size_threshold = 5 * 1024 * 1024  # 5MB
+        
+        # Or if multiple complex features are enabled
+        complex_features = ['tenth_lining', 'repaginate']
+        enabled_complex_features = sum(1 for feature in complex_features if features.get(feature, False))
+        
+        # Or if many documents need merging
+        many_documents = len(documents) > 10
+        
+        return (
+            total_size > size_threshold or
+            (enabled_complex_features >= 2 and len(documents) > 5) or
+            many_documents
+        )
+    
     def _handle_massive_document(self, documents: List[Dict], features: Dict) -> Dict[str, Any]:
         """Handle massive documents with chunked processing strategy"""
         
@@ -950,6 +1049,315 @@ class StatelessLegalProcessor:
         source_doc.close()
         
         return volumes
+    
+    # ==================== BACKGROUND TASK SYSTEM ====================
+    
+    def _submit_background_job(self, event: Dict[str, Any]) -> Dict[str, Any]:
+        """Submit a document processing job to background queue"""
+        try:
+            documents = event.get('documents', [])
+            features = event.get('features', {})
+            
+            if not documents or not any(features.values()):
+                return self._error_response("Invalid job parameters", 400)
+            
+            # Generate unique job ID
+            job_id = str(uuid.uuid4())
+            
+            # Store job in Redis with initial status
+            job_data = {
+                'job_id': job_id,
+                'status': 'queued',
+                'documents': documents,
+                'features': features,
+                'created_at': datetime.utcnow().isoformat(),
+                'progress': 0
+            }
+            
+            # Store job with 24-hour expiration
+            if self.redis_client:
+                self._safe_redis_operation(
+                    self.redis_client.setex,
+                    f"job:{job_id}",
+                    86400,  # 24 hours
+                    json.dumps(job_data)
+                )
+                
+                # Add to processing queue
+                self._safe_redis_operation(
+                    self.redis_client.lpush,
+                    "job_queue",
+                    job_id
+                )
+                
+                # Start background worker if needed
+                self._ensure_background_worker()
+                
+                logger.info(f"Job {job_id} submitted to background queue")
+                
+                return {
+                    'statusCode': 202,  # Accepted
+                    'body': json.dumps({
+                        'success': True,
+                        'job_id': job_id,
+                        'status': 'queued',
+                        'message': 'Job submitted successfully. Use job_id to check status.',
+                        'estimated_completion': (datetime.utcnow() + timedelta(minutes=5)).isoformat()
+                    }),
+                    'headers': {'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*'}
+                }
+            else:
+                # Fallback to immediate processing if no Redis
+                logger.warning("No Redis available, falling back to immediate processing")
+                return self._handle_process_documents(event)
+                
+        except Exception as e:
+            logger.error(f"Failed to submit background job: {e}")
+            return self._error_response(f"Job submission failed: {str(e)}", 500)
+    
+    def _check_job_status(self, event: Dict[str, Any]) -> Dict[str, Any]:
+        """Check the status of a background job"""
+        try:
+            job_id = event.get('job_id')
+            if not job_id:
+                return self._error_response("job_id required", 400)
+            
+            if not self.redis_client:
+                return self._error_response("Job tracking unavailable", 503)
+            
+            # Get job data from Redis
+            job_data_str = self._safe_redis_operation(
+                self.redis_client.get,
+                f"job:{job_id}"
+            )
+            
+            if not job_data_str:
+                return self._error_response("Job not found", 404)
+            
+            job_data = json.loads(job_data_str)
+            
+            return {
+                'statusCode': 200,
+                'body': json.dumps({
+                    'success': True,
+                    'job_id': job_id,
+                    'status': job_data['status'],
+                    'progress': job_data.get('progress', 0),
+                    'created_at': job_data['created_at'],
+                    'updated_at': job_data.get('updated_at'),
+                    'message': job_data.get('message', ''),
+                    'result_ready': job_data['status'] == 'completed'
+                }),
+                'headers': {'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*'}
+            }
+            
+        except Exception as e:
+            logger.error(f"Failed to check job status: {e}")
+            return self._error_response(f"Status check failed: {str(e)}", 500)
+    
+    def _get_job_result(self, event: Dict[str, Any]) -> Dict[str, Any]:
+        """Get the result of a completed background job"""
+        try:
+            job_id = event.get('job_id')
+            if not job_id:
+                return self._error_response("job_id required", 400)
+            
+            if not self.redis_client:
+                return self._error_response("Job results unavailable", 503)
+            
+            # Get job data
+            job_data_str = self._safe_redis_operation(
+                self.redis_client.get,
+                f"job:{job_id}"
+            )
+            
+            if not job_data_str:
+                return self._error_response("Job not found", 404)
+            
+            job_data = json.loads(job_data_str)
+            
+            if job_data['status'] != 'completed':
+                return self._error_response(f"Job not completed. Status: {job_data['status']}", 400)
+            
+            # Get result from Redis
+            result_str = self._safe_redis_operation(
+                self.redis_client.get,
+                f"result:{job_id}"
+            )
+            
+            if not result_str:
+                return self._error_response("Result not found", 404)
+            
+            result_data = json.loads(result_str)
+            
+            # Clean up job and result after retrieval
+            self._safe_redis_operation(self.redis_client.delete, f"job:{job_id}")
+            self._safe_redis_operation(self.redis_client.delete, f"result:{job_id}")
+            
+            return {
+                'statusCode': 200,
+                'body': json.dumps({
+                    'success': True,
+                    'job_id': job_id,
+                    'processed_document': result_data
+                }),
+                'headers': {'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*'}
+            }
+            
+        except Exception as e:
+            logger.error(f"Failed to get job result: {e}")
+            return self._error_response(f"Result retrieval failed: {str(e)}", 500)
+    
+    def _ensure_background_worker(self):
+        """Ensure background worker thread is running"""
+        worker_id = "main_worker"
+        
+        if worker_id not in self.background_workers or not self.background_workers[worker_id].is_alive():
+            worker_thread = threading.Thread(
+                target=self._background_worker_loop,
+                name=f"DocumentProcessor-{worker_id}",
+                daemon=True
+            )
+            worker_thread.start()
+            self.background_workers[worker_id] = worker_thread
+            logger.info(f"Started background worker: {worker_id}")
+    
+    def _background_worker_loop(self):
+        """Background worker that processes jobs from the queue"""
+        logger.info("Background worker started")
+        
+        while not self.is_shutting_down:
+            try:
+                if not self.redis_client:
+                    time.sleep(5)
+                    continue
+                
+                # Get next job from queue (blocking pop with timeout)
+                job_result = self._safe_redis_operation(
+                    self.redis_client.brpop,
+                    "job_queue",
+                    timeout=5
+                )
+                
+                if not job_result:
+                    continue  # Timeout, try again
+                
+                queue_name, job_id = job_result
+                job_id = job_id.decode('utf-8') if isinstance(job_id, bytes) else job_id
+                
+                # Process the job
+                self._process_background_job(job_id)
+                
+            except Exception as e:
+                logger.error(f"Background worker error: {e}")
+                time.sleep(1)  # Brief pause before retrying
+        
+        logger.info("Background worker stopped")
+    
+    def _process_background_job(self, job_id: str):
+        """Process a single background job"""
+        try:
+            # Get job data
+            job_data_str = self._safe_redis_operation(
+                self.redis_client.get,
+                f"job:{job_id}"
+            )
+            
+            if not job_data_str:
+                logger.warning(f"Job {job_id} not found")
+                return
+            
+            job_data = json.loads(job_data_str)
+            
+            # Update status to processing
+            job_data['status'] = 'processing'
+            job_data['updated_at'] = datetime.utcnow().isoformat()
+            job_data['progress'] = 10
+            
+            self._safe_redis_operation(
+                self.redis_client.setex,
+                f"job:{job_id}",
+                86400,
+                json.dumps(job_data)
+            )
+            
+            logger.info(f"Processing job {job_id}")
+            
+            # Process documents
+            documents = job_data['documents']
+            features = job_data['features']
+            
+            # Update progress
+            job_data['progress'] = 25
+            self._safe_redis_operation(
+                self.redis_client.setex,
+                f"job:{job_id}",
+                86400,
+                json.dumps(job_data)
+            )
+            
+            # Actual processing
+            result = self._process_documents_fast(documents, features)
+            
+            # Update progress
+            job_data['progress'] = 90
+            self._safe_redis_operation(
+                self.redis_client.setex,
+                f"job:{job_id}",
+                86400,
+                json.dumps(job_data)
+            )
+            
+            # Store result
+            result_data = {
+                'filename': self._generate_output_filename(documents),
+                'content': result['output_pdf'],
+                'pages': result['total_pages'],
+                'features_applied': result['features_applied'],
+                'processing_time_seconds': result.get('processing_time', 0),
+                'from_cache': False,
+                'processed_at': datetime.utcnow().isoformat()
+            }
+            
+            self._safe_redis_operation(
+                self.redis_client.setex,
+                f"result:{job_id}",
+                86400,  # 24 hours
+                json.dumps(result_data)
+            )
+            
+            # Update job status to completed
+            job_data['status'] = 'completed'
+            job_data['progress'] = 100
+            job_data['message'] = 'Processing completed successfully'
+            job_data['completed_at'] = datetime.utcnow().isoformat()
+            
+            self._safe_redis_operation(
+                self.redis_client.setex,
+                f"job:{job_id}",
+                86400,
+                json.dumps(job_data)
+            )
+            
+            logger.info(f"Job {job_id} completed successfully")
+            
+        except Exception as e:
+            logger.error(f"Job {job_id} failed: {e}")
+            
+            # Update job status to failed
+            try:
+                job_data['status'] = 'failed'
+                job_data['error'] = str(e)
+                job_data['failed_at'] = datetime.utcnow().isoformat()
+                
+                self._safe_redis_operation(
+                    self.redis_client.setex,
+                    f"job:{job_id}",
+                    86400,
+                    json.dumps(job_data)
+                )
+            except:
+                pass  # Don't fail the failure handling
 
 # Serverless function entry points
 processor = StatelessLegalProcessor()
