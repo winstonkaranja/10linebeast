@@ -357,8 +357,12 @@ class StatelessLegalProcessor:
             for page_num, page in enumerate(reader.pages, 1):
                 packet = io.BytesIO()
                 can = canvas.Canvas(packet, pagesize=letter)
-                can.setFont("Helvetica", 15)
-                can.drawString(letter[0] - 50, letter[1] - 30, str(page_num))
+                can.setFont("Helvetica", 18)  # Increased font by 20% (15 * 1.2 = 18)
+                # Position at bottom middle of page
+                page_width = letter[0]
+                x_center = page_width / 2 - 10  # Center horizontally, slight adjustment for text width
+                y_bottom = 30  # 30 points from bottom
+                can.drawString(x_center, y_bottom, str(page_num))
                 can.save()
                 
                 packet.seek(0)
@@ -414,7 +418,7 @@ class StatelessLegalProcessor:
                         page.insert_text(
                             (x, y),
                             str(line_count),
-                            fontsize=9.6,
+                            fontsize=12.5,  # Increased font by 30% (9.6 * 1.3 = 12.48 ≈ 12.5)
                             color=(0.5, 0.5, 0.5)
                         )
             
