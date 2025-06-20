@@ -508,7 +508,8 @@ class StatelessLegalProcessor:
                 })
         
         # Sort lines by vertical position (top to bottom)
-        lines.sort(key=lambda x: -x['y'])  # Negative for top-to-bottom
+        # In PDF coordinates, higher Y values are at the top
+        lines.sort(key=lambda x: x['y'], reverse=True)
         
         return lines
     
