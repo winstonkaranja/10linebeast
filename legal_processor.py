@@ -49,49 +49,47 @@ class StatelessLegalProcessor:
             redishost = os.getenv('REDISHOST')  # Railway's Redis host variable
             redis_host = os.getenv('REDIS_HOST')  # Manual configuration
             
-            # Enhanced connection pool settings for production
-            pool_kwargs = {
+            # Enhanced connection settings for production
+            conn_kwargs = {
                 'decode_responses': True,
                 'socket_connect_timeout': 30,  # Increased from 5 to 30 seconds
                 'socket_timeout': 60,          # Increased from 10 to 60 seconds
                 'socket_keepalive': True,
                 'socket_keepalive_options': {},
-                'connection_pool_class': redis.BlockingConnectionPool,
-                'max_connections': 50,         # Connection pool size
                 'retry_on_timeout': True,
                 'retry_on_error': [redis.ConnectionError, redis.TimeoutError],
                 'health_check_interval': 30
             }
             
             if redis_url:
-                # REDIS_URL format (preferred) with connection pooling
-                self.redis_client = redis.from_url(redis_url, **pool_kwargs)
+                # REDIS_URL format (preferred)
+                self.redis_client = redis.from_url(redis_url, **conn_kwargs)
                 # Test connection
                 self.redis_client.ping()
-                logger.info("Redis connected successfully via REDIS_URL with connection pooling")
+                logger.info("Redis connected successfully via REDIS_URL")
             elif redishost:
-                # Railway's Redis environment variables with connection pooling
+                # Railway's Redis environment variables
                 self.redis_client = redis.Redis(
                     host=redishost,
                     port=int(os.getenv('REDISPORT', 6379)),
                     username=os.getenv('REDISUSER'),
                     password=os.getenv('REDISPASSWORD'),
-                    **pool_kwargs
+                    **conn_kwargs
                 )
                 # Test connection
                 self.redis_client.ping()
-                logger.info("Redis connected successfully via Railway Redis variables with connection pooling")
+                logger.info("Redis connected successfully via Railway Redis variables")
             elif redis_host and not self._is_railway_deployment():
-                # Manual Redis configuration (local development) with connection pooling
+                # Manual Redis configuration (local development)
                 self.redis_client = redis.Redis(
                     host=redis_host,
                     port=int(os.getenv('REDIS_PORT', 6379)),
                     password=os.getenv('REDIS_PASSWORD'),
-                    **pool_kwargs
+                    **conn_kwargs
                 )
                 # Test connection
                 self.redis_client.ping()
-                logger.info("Redis connected successfully via manual configuration with connection pooling")
+                logger.info("Redis connected successfully via manual configuration")
             else:
                 # No Redis configuration found
                 deployment_type = "Railway deployment" if self._is_railway_deployment() else "local environment"
@@ -122,27 +120,10 @@ class StatelessLegalProcessor:
         
         for attempt in range(max_retries + 1):
             try:
-                # Add timeout wrapper for operations
-                import signal
-                
-                def timeout_handler(signum, frame):
-                    raise TimeoutError("Redis operation timeout")
-                
-                # Set alarm for 30 seconds max per operation
-                old_handler = signal.signal(signal.SIGALRM, timeout_handler)
-                signal.alarm(30)
-                
-                try:
-                    result = operation_func(*args, **kwargs)
-                    signal.alarm(0)  # Cancel alarm
-                    signal.signal(signal.SIGALRM, old_handler)  # Restore handler
-                    return result
-                except TimeoutError:
-                    signal.alarm(0)
-                    signal.signal(signal.SIGALRM, old_handler)
-                    raise redis.TimeoutError("Operation timed out after 30 seconds")
+                result = operation_func(*args, **kwargs)
+                return result
                     
-            except (redis.ConnectionError, redis.TimeoutError, TimeoutError) as e:
+            except (redis.ConnectionError, redis.TimeoutError) as e:
                 if attempt < max_retries:
                     delay = retry_delay * (2 ** attempt)  # Exponential backoff
                     logger.warning(f"Redis operation failed (attempt {attempt + 1}/{max_retries + 1}): {e} - retrying in {delay}s")
@@ -275,25 +256,8 @@ class StatelessLegalProcessor:
         # Sort documents by order
         documents.sort(key=lambda x: x.get('order', 0))
         
-        # Process documents with all features applied and timeout protection
-        try:
-            # Add overall processing timeout (5 minutes max)
-            import signal
-            
-            def processing_timeout_handler(signum, frame):
-                raise TimeoutError("Document processing exceeded 5 minutes")
-            
-            old_handler = signal.signal(signal.SIGALRM, processing_timeout_handler)
-            signal.alarm(300)  # 5 minutes
-            
-            result = self._process_documents_fast(documents, features)
-            
-            signal.alarm(0)  # Cancel timeout
-            signal.signal(signal.SIGALRM, old_handler)
-            
-        except TimeoutError as e:
-            logger.error(f"Processing timeout: {e}")
-            return self._error_response("Document processing timed out. Please try again or contact support.", 408)
+        # Process documents with all features applied
+        result = self._process_documents_fast(documents, features)
         
         # Cache the result in Redis with 1-hour expiration
         if self.redis_client:
@@ -424,19 +388,9 @@ class StatelessLegalProcessor:
                 logger.error(f"Failed to decode PDF {doc_data.get('filename', 'unknown')}: {e}")
                 raise ValueError(f"Invalid PDF: {doc_data.get('filename', 'unknown')}")
         
-        # Use optimal thread count for I/O bound operations with timeout
+        # Use optimal thread count for I/O bound operations
         with ThreadPoolExecutor(max_workers=min(len(documents) * 2, self.max_workers)) as executor:
-            try:
-                # Add timeout for PDF decoding (2 minutes max)
-                futures = [executor.submit(decode_single_pdf_fast, doc) for doc in documents]
-                pdf_readers = []
-                
-                for future in as_completed(futures, timeout=120):  # 2 minutes timeout
-                    pdf_readers.append(future.result())
-                    
-            except Exception as e:
-                logger.error(f"PDF decoding failed or timed out: {e}")
-                raise ValueError(f"PDF processing failed: {str(e)}")
+            pdf_readers = list(executor.map(decode_single_pdf_fast, documents))
         
         return pdf_readers
     
