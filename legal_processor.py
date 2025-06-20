@@ -376,7 +376,7 @@ class StatelessLegalProcessor:
             return [add_page_numbers_fast(pdf_objects[0])]
     
     def _apply_tenth_lining_fast(self, pdf_objects: Sequence[PdfObject]) -> List[PdfReader]:
-        """Optimized 10th line numbering"""
+        """Optimized 10th line numbering with improved complex PDF handling"""
         
         def add_tenth_lines_fast(pdf_obj: PdfObject) -> PdfReader:
             if isinstance(pdf_obj, PdfWriter):
@@ -395,28 +395,28 @@ class StatelessLegalProcessor:
             
             for page_num in range(doc.page_count):
                 page = doc[page_num]
+                page_rect = page.rect
+                
+                # Get text blocks and filter for main content
                 text_dict = page.get_text("dict")
+                main_content_lines = self._extract_main_content_lines(text_dict, page_rect)
                 
                 line_count = 0
-                for block in text_dict["blocks"]:
-                    if "lines" in block:
-                        for line in block["lines"]:
-                            line_count += 1
-                            
-                            if line_count % 10 == 0:
-                                line_bbox = line["bbox"]
-                                y = (line_bbox[1] + line_bbox[3]) / 2
-                                
-                                # Right-align the line numbers at the page margin
-                                page_rect = page.rect
-                                x = page_rect.width - 50  # 50 points from right edge
-                                
-                                page.insert_text(
-                                    (x, y),
-                                    str(line_count),
-                                    fontsize=9.6,
-                                    color=(0.5, 0.5, 0.5)
-                                )
+                for line_info in main_content_lines:
+                    line_count += 1
+                    
+                    if line_count % 10 == 0:
+                        y = line_info['y']
+                        
+                        # Right-align the line numbers at the page margin
+                        x = page_rect.width - 50  # 50 points from right edge
+                        
+                        page.insert_text(
+                            (x, y),
+                            str(line_count),
+                            fontsize=9.6,
+                            color=(0.5, 0.5, 0.5)
+                        )
             
             output_buffer = io.BytesIO()
             doc.save(output_buffer)
@@ -431,6 +431,171 @@ class StatelessLegalProcessor:
                 return list(executor.map(add_tenth_lines_fast, pdf_objects))
         else:
             return [add_tenth_lines_fast(pdf_objects[0])]
+    
+    def _extract_main_content_lines(self, text_dict: dict, page_rect) -> list:
+        """Extract only main content lines, filtering out watermarks, headers, footers, and decorative elements"""
+        lines = []
+        page_width = page_rect.width
+        page_height = page_rect.height
+        
+        # Define margins to exclude headers/footers (top 10% and bottom 10% of page)
+        header_threshold = page_height * 0.9  # Top 10%
+        footer_threshold = page_height * 0.1  # Bottom 10%
+        
+        # Define side margins (left/right 5% of page) to exclude margin notes
+        left_margin = page_width * 0.05
+        right_margin = page_width * 0.95
+        
+        for block in text_dict.get("blocks", []):
+            if not block.get("lines"):
+                continue
+                
+            # Skip image blocks (they contain OCR'd text we don't want)
+            if block.get("type") == 1:  # Image block
+                continue
+                
+            block_bbox = block.get("bbox", [0, 0, 0, 0])
+            block_height = block_bbox[3] - block_bbox[1]
+            block_width = block_bbox[2] - block_bbox[0]
+            
+            # Skip very small blocks (likely decorative elements)
+            if block_height < 10 or block_width < 50:
+                continue
+                
+            # Skip blocks in header/footer areas
+            block_center_y = (block_bbox[1] + block_bbox[3]) / 2
+            if block_center_y > header_threshold or block_center_y < footer_threshold:
+                continue
+                
+            # Skip blocks in side margins (margin notes, line numbers, etc.)
+            block_center_x = (block_bbox[0] + block_bbox[2]) / 2
+            if block_center_x < left_margin or block_center_x > right_margin:
+                continue
+            
+            for line in block["lines"]:
+                line_bbox = line.get("bbox", [0, 0, 0, 0])
+                line_text = ""
+                
+                # Extract text from spans
+                for span in line.get("spans", []):
+                    text = span.get("text", "").strip()
+                    if text:
+                        line_text += text + " "
+                
+                line_text = line_text.strip()
+                
+                # Skip empty lines or lines with just whitespace
+                if not line_text or len(line_text) < 3:
+                    continue
+                
+                # Skip lines that look like watermarks (typically short, centered, or repeated)
+                if self._is_likely_watermark(line_text, line_bbox, page_rect):
+                    continue
+                    
+                # Skip lines that are likely headers/footers based on content
+                if self._is_likely_header_footer(line_text):
+                    continue
+                
+                # Skip table headers and single-cell content
+                if self._is_likely_table_element(line_text, line_bbox):
+                    continue
+                
+                y = (line_bbox[1] + line_bbox[3]) / 2
+                lines.append({
+                    'y': y,
+                    'text': line_text,
+                    'bbox': line_bbox
+                })
+        
+        # Sort lines by vertical position (top to bottom)
+        lines.sort(key=lambda x: -x['y'])  # Negative for top-to-bottom
+        
+        return lines
+    
+    def _is_likely_watermark(self, text: str, line_bbox: list, page_rect) -> bool:
+        """Detect if a line is likely a watermark"""
+        # Check for common watermark keywords
+        watermark_keywords = [
+            'draft', 'confidential', 'copy', 'sample', 'watermark', 
+            'preview', 'trial', 'demo', 'copyright', '©', 'trademark'
+        ]
+        
+        text_lower = text.lower()
+        if any(keyword in text_lower for keyword in watermark_keywords):
+            return True
+        
+        # Check if text is centered (likely watermark)
+        line_center_x = (line_bbox[0] + line_bbox[2]) / 2
+        page_center_x = page_rect.width / 2
+        if abs(line_center_x - page_center_x) < 50:  # Within 50 points of center
+            # Short centered text is likely a watermark
+            if len(text) < 30:
+                return True
+        
+        # Check for repeated single words (common in watermarks)
+        words = text.split()
+        if len(words) == 1 and len(words[0]) < 15:
+            return True
+            
+        return False
+    
+    def _is_likely_header_footer(self, text: str) -> bool:
+        """Detect if a line is likely a header or footer"""
+        text_lower = text.lower()
+        
+        # Common header/footer patterns
+        header_footer_patterns = [
+            'page', 'chapter', 'section', 'exhibit', 'appendix',
+            'confidential', 'attorney-client', 'privileged',
+            'copyright', 'all rights reserved', '©'
+        ]
+        
+        # Check for page numbers (standalone numbers)
+        if text.strip().isdigit() and len(text.strip()) < 4:
+            return True
+            
+        # Check for common header/footer text
+        if any(pattern in text_lower for pattern in header_footer_patterns):
+            return True
+            
+        # Check for date patterns
+        import re
+        date_patterns = [
+            r'\d{1,2}/\d{1,2}/\d{2,4}',
+            r'\d{1,2}-\d{1,2}-\d{2,4}',
+            r'\w+ \d{1,2}, \d{4}'
+        ]
+        
+        if any(re.search(pattern, text) for pattern in date_patterns):
+            return True
+            
+        return False
+    
+    def _is_likely_table_element(self, text: str, line_bbox: list) -> bool:
+        """Detect if a line is likely part of a table header or single cell"""
+        # Very short text is likely a table cell
+        if len(text.strip()) < 3:
+            return True
+            
+        # Single words that are likely column headers
+        single_word_headers = [
+            'name', 'date', 'amount', 'total', 'item', 'description',
+            'quantity', 'price', 'cost', 'number', 'id', 'type',
+            'status', 'yes', 'no', 'n/a', 'tbd', 'pending'
+        ]
+        
+        words = text.lower().split()
+        if len(words) == 1 and words[0] in single_word_headers:
+            return True
+            
+        # Lines with mostly numbers/symbols (table data)
+        non_alpha = sum(1 for c in text if not c.isalpha() and not c.isspace())
+        alpha = sum(1 for c in text if c.isalpha())
+        
+        if non_alpha > alpha and len(text) < 20:
+            return True
+            
+        return False
     
     def _pdf_to_base64(self, pdf_obj: PdfObject) -> str:
         """Convert PDF object to base64 string"""
