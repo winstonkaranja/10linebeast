@@ -249,19 +249,39 @@ class StatelessLegalProcessor:
             else:
                 logger.warning(f"Failed to cache result for {cache_key} - proceeding without cache")
         
-        return {
-            'statusCode': 200,
-            'body': json.dumps({
-                'success': True,
+        # Apple-style response: Smart format based on document size
+        response_body = {
+            'success': True,
+            'processing_time_seconds': result.get('processing_time', 0),
+            'features_applied': result['features_applied'],
+            'from_cache': False
+        }
+        
+        if 'volumes' in result:
+            # Large document split into court-compliant volumes
+            response_body.update({
+                'document_type': 'volumes',
+                'total_pages': result['total_pages'],
+                'volume_count': result['volume_count'],
+                'volumes': result['volumes'],
+                'court_compliant': True,
+                'message': f'Document split into {result["volume_count"]} court-compliant volumes'
+            })
+        else:
+            # Single document under 500 pages
+            response_body.update({
+                'document_type': 'single',
                 'processed_document': {
                     'filename': self._generate_output_filename(documents),
                     'content': result['output_pdf'],
                     'pages': result['total_pages'],
-                    'features_applied': result['features_applied'],
-                    'processing_time_seconds': result.get('processing_time', 0),
-                    'from_cache': False
+                    'court_compliant': result['total_pages'] <= 500
                 }
-            }),
+            })
+        
+        return {
+            'statusCode': 200,
+            'body': json.dumps(response_body),
             'headers': {'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*'}
         }
 
@@ -304,9 +324,23 @@ class StatelessLegalProcessor:
             result['features_applied'].append('tenth_lining')
             logger.info("10th lining applied")
         
-        # Convert final result to base64
+        # Final PDF preparation
         final_pdf = current_pdfs[0] if len(current_pdfs) == 1 else self._merge_pdfs_fast(current_pdfs)
-        result['output_pdf'] = self._pdf_to_base64(final_pdf)
+        
+        # Apple-style: Automatic volume splitting for court compliance
+        # Always split large documents (>500 pages) into court-friendly volumes
+        total_pages = result['total_pages']
+        if total_pages > 500:
+            logger.info(f"Large document detected ({total_pages} pages) - creating court volumes")
+            volumes = self._split_into_court_volumes(final_pdf, total_pages)
+            result['volumes'] = volumes
+            result['volume_count'] = len(volumes)
+            result['features_applied'].append('auto_volume_splitting')
+            logger.info(f"Split into {len(volumes)} court-compliant volumes")
+        else:
+            # Single document under 500 pages
+            result['output_pdf'] = self._pdf_to_base64(final_pdf)
+        
         result['processing_time'] = round(time.time() - start_time, 2)
         
         return result
@@ -848,6 +882,74 @@ class StatelessLegalProcessor:
             'total_chunks': len(processed_chunks),
             'features_applied': first_chunk['features_applied']
         }
+    
+    def _split_into_court_volumes(self, pdf_obj: PdfObject, total_pages: int) -> List[Dict]:
+        """
+        Apple-style: Automatically split large documents into court-compliant volumes
+        Court standard: 500 pages per volume maximum
+        """
+        
+        PAGES_PER_VOLUME = 500  # Court-mandated standard
+        volumes = []
+        
+        # Convert PDF to PyMuPDF document for page extraction
+        if isinstance(pdf_obj, PdfWriter):
+            temp_buffer = io.BytesIO()
+            pdf_obj.write(temp_buffer)
+            temp_buffer.seek(0)
+            source_doc = fitz.Document(stream=temp_buffer.read(), filetype="pdf")
+        else:
+            # Convert PdfReader to fitz Document
+            temp_buffer = io.BytesIO()
+            writer = PdfWriter()
+            for page in pdf_obj.pages:
+                writer.add_page(page)
+            writer.write(temp_buffer)
+            temp_buffer.seek(0)
+            source_doc = fitz.Document(stream=temp_buffer.read(), filetype="pdf")
+        
+        # Calculate number of volumes needed
+        num_volumes = (total_pages + PAGES_PER_VOLUME - 1) // PAGES_PER_VOLUME
+        
+        for volume_num in range(1, num_volumes + 1):
+            # Calculate page range for this volume
+            start_page = (volume_num - 1) * PAGES_PER_VOLUME
+            end_page = min(start_page + PAGES_PER_VOLUME - 1, total_pages - 1)
+            
+            # Create new document for this volume
+            volume_doc = fitz.Document()
+            
+            # Copy pages to volume
+            for page_idx in range(start_page, end_page + 1):
+                if page_idx < source_doc.page_count:
+                    volume_doc.insert_pdf(source_doc, from_page=page_idx, to_page=page_idx)
+            
+            # Convert volume to base64
+            volume_buffer = io.BytesIO()
+            volume_doc.save(volume_buffer)
+            volume_doc.close()
+            volume_buffer.seek(0)
+            
+            volume_base64 = base64.b64encode(volume_buffer.getvalue()).decode('utf-8')
+            
+            # Calculate actual pages in this volume
+            actual_pages = end_page - start_page + 1
+            
+            volumes.append({
+                'volume_number': volume_num,
+                'filename': f"Volume_{volume_num}.pdf",
+                'content': volume_base64,
+                'pages': actual_pages,
+                'page_range': f"{start_page + 1}-{end_page + 1}",  # Human-readable page numbers
+                'court_compliant': True
+            })
+            
+            logger.info(f"Created Volume {volume_num}: Pages {start_page + 1}-{end_page + 1} ({actual_pages} pages)")
+        
+        # Clean up source document
+        source_doc.close()
+        
+        return volumes
 
 # Serverless function entry points
 processor = StatelessLegalProcessor()
